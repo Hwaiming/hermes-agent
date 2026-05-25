@@ -93,6 +93,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
                cli_only=True, aliases=("snap",), args_hint="[create|restore <id>|prune]"),
     CommandDef("stop", "Kill all running background processes", "Session"),
+    CommandDef("reflect", "进入反思态，缓存本轮有价值对话到近记忆", "Session",
+               aliases=("总结", "回顾",)),
     CommandDef("approve", "Approve a pending dangerous command", "Session",
                gateway_only=True, args_hint="[session|always]"),
     CommandDef("deny", "Deny a pending dangerous command", "Session",
@@ -217,6 +219,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info"),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
+
+    # Content
+    CommandDef("bilibili", "总结B站视频内容 (输入BVID或链接)", "Info",
+               cli_only=True, args_hint="<BVID或URL>"),
+
+    # WebUI
+    CommandDef("webui", "Launch the Hermes WebUI dashboard", "Info",
+               cli_only=True, args_hint="[port] [--host HOST] [--no-browser]"),
 
     # Exit
     CommandDef("quit", "Exit the CLI (use --delete to also remove session history)", "Exit",

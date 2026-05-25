@@ -39,6 +39,107 @@ from typing import Any, Dict, List, Optional, Union
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
 
+def _get_session_search_timeout(default: float = 15.0) -> float:
+    """Read auxiliary.session_search.timeout from config (seconds).
+
+    The config value is the user-facing timeout — the LLM summarisation
+    deadline.  If unset, defaults to 15 s so the tool returns promptly
+    with whatever it has (including FTS5 raw snippets for unfinished
+    summaries) rather than blocking the agent loop for minutes.
+    """
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+    except ImportError:
+        return default
+    aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+    task_config = aux.get("session_search", {}) if isinstance(aux, dict) else {}
+    if not isinstance(task_config, dict):
+        return default
+    raw = task_config.get("timeout")
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(5.0, min(value, 120.0))
+
+
+# ── Query-vagueness heuristic ────────────────────────────────────────────
+# If the query is too vague, a full FTS5 + LLM summarisation pipeline is
+# wasteful — the user can narrow down with a single glance at recent
+# sessions.  We surface the near-memory cache (or recent session list)
+# and ask the user for more specific keywords instead.
+
+_VAGUE_QUERY_MIN_CHARS = 4  # shorter than this → definitely vague
+
+_VAGUE_PATTERNS: list = [
+    # Pronouns / demonstratives with no content
+    r"^(上次|上回|之前|那个|那些|这个|这些|咱|我们).{0,3}$",
+    r"^(怎么|如何|怎样).{0,5}$",
+    r"^(帮我|替我|查查|找找|看看).{0,5}$",
+    r"^(那个|哪).{0,6}(修|改|做|处理|搞|弄)?.{0,3}$",
+    # Single generic noun without qualifiers
+    r"^(bug|错误|问题|文章|代码|方案|项目|任务|配置|文件|脚本)$",
+]
+
+
+def _is_query_too_vague(query: str) -> bool:
+    """Return True if *query* is too vague for an FTS5 + LLM pipeline."""
+    q = query.strip()
+    if len(q) < _VAGUE_QUERY_MIN_CHARS:
+        return True
+    for pattern in _VAGUE_PATTERNS:
+        if re.search(pattern, q, re.IGNORECASE):
+            return True
+    return False
+
+
+# ── Inline near-memory cache (no external imports) ─────────────────────
+# This avoids module-reload issues in long-running Hermes agent processes.
+# The near_memory_cache.py module is the canonical API for writes; here we
+# just read the same JSON file directly.
+
+import os as _os
+
+_NEAR_CACHE_PATH = _os.path.join(
+    _os.path.expanduser(_os.environ.get("HERMES_HOME", "~/.hermes")),
+    "sessions",
+    "recent_cache.json",
+)
+
+
+def _load_near_cache() -> List[Dict[str, Any]]:
+    """Return cache entries list (empty if file missing/corrupt)."""
+    if not _os.path.exists(_NEAR_CACHE_PATH):
+        return []
+    try:
+        with open(_NEAR_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data.get("entries", [])
+    except Exception:
+        return []
+    return []
+
+
+def _search_near_cache_inline(query: str) -> List[Dict[str, Any]]:
+    """Fuzzy-search cache entries by keyword overlap."""
+    entries = _load_near_cache()
+    if not entries:
+        return []
+    keywords = query.strip().lower().split()
+    scored = []
+    for e in entries:
+        text = (e.get("topic", "") + " " + e.get("summary", "")).lower()
+        score = sum(1 for kw in keywords if kw in text)
+        if score > 0:
+            scored.append((score, e))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [entry for _, entry in scored]
+
+
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
 
@@ -64,22 +165,184 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     return str(ts)
 
 
-def _resolve_to_parent(db, session_id: str) -> str:
-    """Walk parent_session_id chain to the lineage root. Falls back to input on errors."""
-    if not session_id:
-        return session_id
-    visited = set()
-    cur = session_id
-    while cur and cur not in visited:
-        visited.add(cur)
+def _format_conversation(messages: List[Dict[str, Any]]) -> str:
+    """Format session messages into a readable transcript for summarization."""
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "unknown").upper()
+        content = msg.get("content") or ""
+        tool_name = msg.get("tool_name")
+
+        if role == "TOOL" and tool_name:
+            # Truncate long tool outputs
+            if len(content) > 500:
+                content = content[:250] + "\n...[truncated]...\n" + content[-250:]
+            parts.append(f"[TOOL:{tool_name}]: {content}")
+        elif role == "ASSISTANT":
+            # Include tool call names if present
+            tool_calls = msg.get("tool_calls")
+            if tool_calls and isinstance(tool_calls, list):
+                tc_names = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        name = tc.get("name") or tc.get("function", {}).get("name", "?")
+                        tc_names.append(name)
+                if tc_names:
+                    parts.append(f"[ASSISTANT]: [Called: {', '.join(tc_names)}]")
+                if content:
+                    parts.append(f"[ASSISTANT]: {content}")
+            else:
+                parts.append(f"[ASSISTANT]: {content}")
+        else:
+            parts.append(f"[{role}]: {content}")
+
+    return "\n\n".join(parts)
+
+
+def _truncate_around_matches(
+    full_text: str, query: str, max_chars: int = MAX_SESSION_CHARS
+) -> str:
+    """
+    Truncate a conversation transcript to *max_chars*, choosing a window
+    that maximises coverage of positions where the *query* actually appears.
+
+    Strategy (in priority order):
+    1. Try to find the full query as a phrase (case-insensitive).
+    2. If no phrase hit, look for positions where all query terms appear
+       within a 200-char proximity window (co-occurrence).
+    3. Fall back to individual term positions.
+
+    Once candidate positions are collected the function picks the window
+    start that covers the most of them.
+    """
+    if len(full_text) <= max_chars:
+        return full_text
+
+    text_lower = full_text.lower()
+    query_lower = query.lower().strip()
+    match_positions: list[int] = []
+
+    # --- 1. Full-phrase search ------------------------------------------------
+    phrase_pat = re.compile(re.escape(query_lower))
+    match_positions = [m.start() for m in phrase_pat.finditer(text_lower)]
+
+    # --- 2. Proximity co-occurrence of all terms (within 200 chars) -----------
+    if not match_positions:
+        terms = query_lower.split()
+        if len(terms) > 1:
+            # Collect every occurrence of each term
+            term_positions: dict[str, list[int]] = {}
+            for t in terms:
+                term_positions[t] = [
+                    m.start() for m in re.finditer(re.escape(t), text_lower)
+                ]
+            # Slide through positions of the rarest term and check proximity
+            rarest = min(terms, key=lambda t: len(term_positions.get(t, [])))
+            for pos in term_positions.get(rarest, []):
+                if all(
+                    any(abs(p - pos) < 200 for p in term_positions.get(t, []))
+                    for t in terms
+                    if t != rarest
+                ):
+                    match_positions.append(pos)
+
+    # --- 3. Individual term positions (last resort) ---------------------------
+    if not match_positions:
+        terms = query_lower.split()
+        for t in terms:
+            for m in re.finditer(re.escape(t), text_lower):
+                match_positions.append(m.start())
+
+    if not match_positions:
+        # Nothing at all — take from the start
+        truncated = full_text[:max_chars]
+        suffix = "\n\n...[later conversation truncated]..." if max_chars < len(full_text) else ""
+        return truncated + suffix
+
+    # --- Pick window that covers the most match positions ---------------------
+    match_positions.sort()
+
+    best_start = 0
+    best_count = 0
+    for candidate in match_positions:
+        ws = max(0, candidate - max_chars // 4)  # bias: 25% before, 75% after
+        we = ws + max_chars
+        if we > len(full_text):
+            ws = max(0, len(full_text) - max_chars)
+            we = len(full_text)
+        count = sum(1 for p in match_positions if ws <= p < we)
+        if count > best_count:
+            best_count = count
+            best_start = ws
+
+    start = best_start
+    end = min(len(full_text), start + max_chars)
+
+    truncated = full_text[start:end]
+    prefix = "...[earlier conversation truncated]...\n\n" if start > 0 else ""
+    suffix = "\n\n...[later conversation truncated]..." if end < len(full_text) else ""
+    return prefix + truncated + suffix
+
+
+async def _summarize_session(
+    conversation_text: str, query: str, session_meta: Dict[str, Any],
+    timeout: float = None,
+) -> Optional[str]:
+    """Summarize a single session conversation focused on the search query.
+
+    Accepts an optional *timeout* (seconds) for the LLM call.  When the
+    deadline is exceeded the caller should treat the result as a failure
+    and fall back to an FTS5 raw snippet — no retries here because the
+    caller's deadline is the user's deadline, not ours.
+    """
+    system_prompt = (
+        "You are reviewing a past conversation transcript to help recall what happened. "
+        "Summarize the conversation with a focus on the search topic. Include:\n"
+        "1. What the user asked about or wanted to accomplish\n"
+        "2. What actions were taken and what the outcomes were\n"
+        "3. Key decisions, solutions found, or conclusions reached\n"
+        "4. Any specific commands, files, URLs, or technical details that were important\n"
+        "5. Anything left unresolved or notable\n\n"
+        "Be thorough but concise. Preserve specific details (commands, paths, error messages) "
+        "that would be useful to recall. Write in past tense as a factual recap."
+    )
+
+    source = session_meta.get("source", "unknown")
+    started = _format_timestamp(session_meta.get("started_at"))
+
+    user_prompt = (
+        f"Search topic: {query}\n"
+        f"Session source: {source}\n"
+        f"Session date: {started}\n\n"
+        f"CONVERSATION TRANSCRIPT:\n{conversation_text}\n\n"
+        f"Summarize this conversation with focus on: {query}"
+    )
+
+    max_retries = 1  # no retries — caller deadline is user's deadline
+    for attempt in range(max_retries):
         try:
-            s = db.get_session(cur)
-            if not s:
-                break
-            parent = s.get("parent_session_id")
-            if not parent:
-                break
-            cur = parent
+            response = await async_call_llm(
+                task="session_search",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=MAX_SUMMARY_TOKENS,
+                timeout=timeout,
+            )
+            content = extract_content_or_reasoning(response)
+            if content:
+                return content
+            # Reasoning-only / empty — let the retry loop handle it
+            logging.warning("Session search LLM returned empty content (attempt %d/%d)", attempt + 1, max_retries)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1 * (attempt + 1))
+                continue
+            return content
+        except RuntimeError:
+            logging.warning("No auxiliary model available for session summarization")
+            return None
         except Exception as e:
             logging.debug("Error resolving parent for %s: %s", cur, e, exc_info=True)
             break
@@ -200,7 +463,53 @@ def _scroll(
     if not session_meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
 
-    # Fetch the window
+    # ── L1 · Near-memory cache lookup ──────────────────────────────────
+    # Before hitting FTS5 + LLM (expensive), check the lightweight cache.
+    # - Hit → return immediately (no LLM cost).
+    # - Miss + vague query → surface recent cache to help user narrow down.
+    # - Miss + specific query → fall through to FTS5 pipeline below.
+    cache_hits = _search_near_cache_inline(query)
+    if cache_hits:
+        return json.dumps({
+            "success": True,
+            "mode": "cache",
+            "query": query,
+            "results": [
+                {
+                    "session_id": e["session_id"],
+                    "date": e.get("date", ""),
+                    "topic": e.get("topic", ""),
+                    "summary": e.get("summary", ""),
+                    "cached_at": e.get("cached_at", ""),
+                }
+                for e in cache_hits[:limit]
+            ],
+            "count": min(len(cache_hits), limit),
+            "source": "near_memory_cache",
+        }, ensure_ascii=False)
+
+    if _is_query_too_vague(query):
+        recent = _load_near_cache()[:10]
+        return json.dumps({
+            "success": True,
+            "mode": "vague_redirect",
+            "query": query,
+            "message": (
+                "查询太模糊，我无法确定你想找哪次会话。"
+                "以下是最近 10 次有实质内容的会话，请告诉我大致时间或关键词，我来精准搜索。"
+            ),
+            "recent_sessions": [
+                {
+                    "session_id": e["session_id"],
+                    "date": e.get("date", ""),
+                    "topic": e.get("topic", ""),
+                    "summary": e.get("summary", ""),
+                }
+                for e in recent
+            ],
+            "count": len(recent),
+        }, ensure_ascii=False)
+
     try:
         view = db.get_messages_around(session_id, around_message_id, window=window)
     except Exception as e:
@@ -390,21 +699,117 @@ def session_search(
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
-    Discovery: pass ``query``.
-    Scroll:    pass ``session_id`` + ``around_message_id``.
-    Browse:    pass nothing.
+        # Prepare all sessions for parallel summarization
+        tasks = []
+        for session_id, match_info in seen_sessions.items():
+            try:
+                messages = db.get_messages_as_conversation(session_id)
+                if not messages:
+                    continue
+                session_meta = db.get_session(session_id) or {}
+                conversation_text = _format_conversation(messages)
+                conversation_text = _truncate_around_matches(conversation_text, query)
+                tasks.append((session_id, match_info, conversation_text, session_meta))
+            except Exception as e:
+                logging.warning(
+                    "Failed to prepare session %s: %s",
+                    session_id,
+                    e,
+                    exc_info=True,
+                )
+
+        # Summarize all sessions with a firm deadline and graceful degradation.
+        # asyncio.wait() returns (done, pending) so we can deliver completed
+        # summaries immediately and fall back to FTS5 raw snippets for the rest
+        # — the user gets *something* on time instead of waiting minutes.
+        search_timeout = _get_session_search_timeout()
+        max_concurrency = min(_get_session_search_max_concurrency(), max(1, len(tasks)))
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def _bounded_summary(text: str, meta: Dict[str, Any]) -> Optional[str]:
+            async with semaphore:
+                return await _summarize_session(text, query, meta, timeout=search_timeout)
+
+        async def _summarize_all_with_deadline() -> List[Optional[str]]:
+            coros = [
+                _bounded_summary(text, meta)
+                for _, _, text, meta in tasks
+            ]
+            # Python ≥3.12: asyncio.wait requires Task objects, not raw coroutines.
+            tasks_ = [asyncio.ensure_future(c) for c in coros]
+            done, pending = await asyncio.wait(tasks_, timeout=search_timeout)
+            # Build results in task order.  Completed → summary; timed-out → None
+            # (caller fills in FTS5 raw snippet as fallback).
+            # Key on Task objects, not coroutines — asyncio.wait returns Tasks.
+            task_to_idx = {task: i for i, task in enumerate(tasks_)}
+            results = [None] * len(tasks_)
+            for finished in done:
+                idx = task_to_idx.get(finished)
+                if idx is not None:
+                    exc = finished.exception()
+                    if exc is not None:
+                        logging.warning(
+                            "Session summary call %d failed: %s", idx, exc, exc_info=True,
+                        )
+                    else:
+                        results[idx] = finished.result()
+            if pending:
+                logging.info(
+                    "Session summarisation deadline reached (%s s): %d/%d summaries "
+                    "completed, %d will use FTS5 raw snippets.",
+                    search_timeout,
+                    len(done),
+                    len(tasks_),
+                    len(pending),
+                )
+            return results
 
     Scroll wins over discovery when both are set — the agent has explicitly
     asked for a slice of a known session.
     """
     if db is None:
         try:
-            from hermes_state import SessionDB
-            db = SessionDB()
-        except Exception:
-            logging.debug("SessionDB unavailable for session_search", exc_info=True)
-            from hermes_state import format_session_db_unavailable
-            return tool_error(format_session_db_unavailable(), success=False)
+            # Use _run_async() which properly manages event loops across
+            # CLI, gateway, and worker-thread contexts.  The previous
+            # pattern (asyncio.run() in a ThreadPoolExecutor) created a
+            # disposable event loop that conflicted with cached
+            # AsyncOpenAI/httpx clients bound to a different loop,
+            # causing deadlocks in gateway mode (#2681).
+            from model_tools import _run_async
+            results = _run_async(_summarize_all_with_deadline(),
+                                 timeout=search_timeout + 5)
+        except concurrent.futures.TimeoutError:
+            logging.warning(
+                "Session summarisation timed out after %.0f seconds (event-loop deadline)",
+                search_timeout + 5,
+                exc_info=True,
+            )
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Session summarisation timed out ({search_timeout:.0f}s deadline). "
+                    "Try a more specific query or reduce the limit."
+                ),
+            }, ensure_ascii=False)
+
+        summaries = []
+        for (session_id, match_info, conversation_text, session_meta), result in zip(tasks, results):
+            # result is None when the LLM call timed out (asyncio.wait deadline)
+            # or failed — we fall back to an FTS5 raw snippet below.
+
+            # Prefer resolved parent session metadata over FTS5 match metadata.
+            # match_info carries source/model from the *child* session that contained
+            # the FTS5 hit; after _resolve_to_parent() the session_id points to the
+            # root, so session_meta has the authoritative platform/source for the
+            # session the user actually cares about (#15909).
+            entry = {
+                "session_id": session_id,
+                "when": _format_timestamp(
+                    session_meta.get("started_at") or match_info.get("session_started")
+                ),
+                "source": session_meta.get("source") or match_info.get("source", "unknown"),
+                "model": session_meta.get("model") or match_info.get("model"),
+            }
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:

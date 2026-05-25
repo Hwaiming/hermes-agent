@@ -9076,6 +9076,59 @@ class HermesCLI:
             self._handle_voice_command(cmd_original)
         elif canonical == "busy":
             self._handle_busy_command(cmd_original)
+        elif canonical == "webui":
+            # Launch Hermes WebUI
+            import subprocess as _sp
+            _webui_dir = os.path.expanduser("~/hermes-webui")
+            if not os.path.isdir(_webui_dir):
+                _cprint(f"  \033[1;31mHermes WebUI not found at {_webui_dir}{_RST}")
+            else:
+                parts = cmd_original.split(maxsplit=1)
+                args = parts[1] if len(parts) > 1 else ""
+                print()
+                _cprint(f"  \033[1;36m☯ 启动 Hermes WebUI 丹炉...{_RST}")
+                try:
+                    _proc = _sp.Popen(
+                        f"cd {_webui_dir} && python3 bootstrap.py {args}",
+                        shell=True,
+                        start_new_session=True,
+                    )
+                    print(f"  \033[1;32m✓ WebUI 丹炉已点燃 (PID: {_proc.pid}){_RST}")
+                    print(f"  \033[2;37m  浏览器打开 http://localhost:7878 即可登堂入室{_RST}")
+                except Exception as _exc:
+                    _cprint(f"  \033[1;31m启动失败: {_exc}{_RST}")
+                print()
+        elif canonical == "bilibili":
+            # B站视频总结
+            parts = cmd_original.split(maxsplit=1)
+            bvid_arg = parts[1].strip() if len(parts) > 1 else ""
+            if not bvid_arg:
+                _cprint(f"  \033[1;33m用法: /bilibili <BVID或URL>\033[0m")
+            else:
+                import subprocess as _sp
+                _skill_script = os.path.expanduser(
+                    "~/.hermes/skills/research/bilibili-summary/scripts/summarize.py"
+                )
+                _venv_python = os.path.expanduser(
+                    "~/.hermes/hermes-agent/venv/bin/python3"
+                )
+                print()
+                _cprint(f"  \033[1;36m☯ 总结B站视频: {bvid_arg[:50]}...{_RST}")
+                try:
+                    _result = _sp.run(
+                        [_venv_python, _skill_script, bvid_arg],
+                        capture_output=True, text=True, timeout=300,
+                    )
+                    if _result.returncode == 0:
+                        for _line in _result.stdout.splitlines():
+                            print(f"  {_line}")
+                    else:
+                        _cprint(f"  \033[1;31m失败: {_result.stderr[:200]}{_RST}")
+                except _sp.TimeoutExpired:
+                    _cprint(f"  \033[1;31m超时（>5分钟），视频可能较长或网络慢{_RST}")
+                except Exception as _exc:
+                    _cprint(f"  \033[1;31m异常: {_exc}{_RST}")
+                print()
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]

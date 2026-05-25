@@ -81,7 +81,7 @@ def _get_worker_loop():
     return loop
 
 
-def _run_async(coro):
+def _run_async(coro, timeout: float = None):
     """Run an async coroutine from a sync context.
 
     If the current thread already has a running event loop (e.g., inside
@@ -97,6 +97,11 @@ def _run_async(coro):
     per-thread persistent loop to avoid both contention with the main
     thread's shared loop AND the "Event loop is closed" errors caused by
     asyncio.run()'s create-and-destroy lifecycle.
+
+    *timeout* is the wall-clock deadline in seconds for the entire
+    coroutine.  None (default) uses a generous 300 s hard cap.  Callers
+    that need a user-facing deadline (e.g. session_search with a 15 s
+    SLA) should pass an explicit value.
 
     This is the single source of truth for sync->async bridging in tool
     handlers. Each handler is self-protecting via this function.
@@ -142,7 +147,7 @@ def _run_async(coro):
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = pool.submit(_run_in_worker)
         try:
-            return future.result(timeout=300)
+            return future.result(timeout=timeout if timeout is not None else 300)
         except concurrent.futures.TimeoutError:
             # Cancel the coroutine inside its own loop so the worker thread
             # can wind down instead of running forever.
